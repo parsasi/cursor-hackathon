@@ -2,10 +2,7 @@
   "name": "rustling-lynx",
   "version": "0.1.0",
   "type": "module",
-  "scripts": {
-    "dev": "bun run --hot src/index.ts",
-    "start": "bun run src/index.ts"
-  },
+  "scripts": {},
   "dependencies": {
     "hono": "^4.7.0",
     "isomorphic-dompurify": "^2.20.0",
