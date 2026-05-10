@@ -1,9 +1,8 @@
 import { Hono } from 'hono';
 import { setCookie } from 'hono/cookie';
 import { extractSignals } from './signals.ts';
-import { generate } from './generate.ts';
-import { sanitize } from './sanitize.ts';
-import { shell } from './shell.ts';
+import { generateSlotsStreaming } from './generate.ts';
+import { shellStreamPage } from './shell.ts';
 
 const DEFAULT_PORT = 3000;
 
@@ -44,8 +43,19 @@ const port = resolvePort();
 
 const app = new Hono();
 
+/** Non-stream snapshot for logging parity with streamed generation (stream uses its own extraction). */
+function logSignals(ts: () => string, profile: ReturnType<typeof extractSignals>): void {
+  console.log(`\n${ts()} ── signals extracted ─────────────────────────`);
+  console.log(`  country  : ${profile.country}`);
+  console.log(`  device   : ${profile.device}`);
+  console.log(`  lang     : ${profile.lang}`);
+  console.log(`  referer  : ${profile.referer}`);
+  console.log(`  utm      : ${JSON.stringify(profile.utm)}`);
+  console.log(`  visit #  : ${profile.visitCount + 1}`);
+  console.log(`  UTC hour : ${profile.hourUtc}`);
+}
+
 app.get('/', async (c) => {
-  const start = Date.now();
   const ts = () => `[${new Date().toISOString()}]`;
 
   console.log(`\n${ts()} ── incoming request ─────────────────────────`);
@@ -55,14 +65,7 @@ app.get('/', async (c) => {
   console.log(`  accept-lang: ${c.req.header('accept-language') ?? '(none)'}`);
 
   const profile = extractSignals(c);
-  console.log(`\n${ts()} ── signals extracted ─────────────────────────`);
-  console.log(`  country  : ${profile.country}`);
-  console.log(`  device   : ${profile.device}`);
-  console.log(`  lang     : ${profile.lang}`);
-  console.log(`  referer  : ${profile.referer}`);
-  console.log(`  utm      : ${JSON.stringify(profile.utm)}`);
-  console.log(`  visit #  : ${profile.visitCount + 1}`);
-  console.log(`  UTC hour : ${profile.hourUtc}`);
+  logSignals(ts, profile);
 
   setCookie(c, 'visit_count', String(profile.visitCount + 1), {
     path: '/',
@@ -71,25 +74,66 @@ app.get('/', async (c) => {
     sameSite: 'Lax',
   });
 
-  console.log(`\n${ts()} ── calling AI ────────────────────────────────`);
-  const aiStart = Date.now();
-  const rawHtml = await generate(profile);
-  const aiMs = Date.now() - aiStart;
-  console.log(`${ts()} ── AI done (${aiMs}ms, ${rawHtml.length} chars) ──────────────`);
-
-  const safeHtml = sanitize(rawHtml);
-  const stripped = rawHtml.length - safeHtml.length;
-  console.log(`${ts()} ── sanitized (${stripped} chars stripped) ─────────────────`);
-
-  const totalMs = Date.now() - start;
-  console.log(`${ts()} ── response sent (${totalMs}ms total) ────────────────────\n`);
+  console.log(`${ts()} ── HTML shell sent (stream via GET /stream) ──────────────\n`);
 
   c.header('Cache-Control', 'no-store');
-  return c.html(shell(safeHtml, profile));
+  return c.html(shellStreamPage(profile));
+});
+
+app.get('/stream', async (c) => {
+  const ts = () => `[${new Date().toISOString()}]`;
+  const profile = extractSignals(c);
+
+  console.log(`\n${ts()} ── /stream open ─────────────────────────────`);
+  logSignals(ts, profile);
+  console.log(`${ts()} ── AI stream starting ─────────────────────────`);
+
+  const encoder = new TextEncoder();
+  const sseData = (obj: Record<string, unknown>) => encoder.encode(`data: ${JSON.stringify(obj)}\n\n`);
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const t0 = Date.now();
+      try {
+        await generateSlotsStreaming(
+          profile,
+          {
+            async onSlot(slot, html) {
+              controller.enqueue(sseData({ type: 'slot', slot, html }));
+            },
+            async onComplete(errorMessage) {
+              controller.enqueue(sseData({ type: 'done', error: errorMessage ?? null }));
+              controller.close();
+              console.log(`${ts()} ── stream closed (${Date.now() - t0}ms) ──────────────\n`);
+            },
+          },
+          c.req.raw.signal,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`${ts()} ── stream controller error: ${msg}`);
+        try {
+          controller.enqueue(sseData({ type: 'done', error: msg }));
+          controller.close();
+        } catch {
+          controller.error(err instanceof Error ? err : new Error(msg));
+        }
+      }
+    },
+  });
+
+  c.header('Cache-Control', 'no-store');
+  c.header('Connection', 'keep-alive');
+  return c.newResponse(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+    },
+  });
 });
 
 export default {
   port,
-  idleTimeout: 60,
+  idleTimeout: 120,
   fetch: app.fetch,
 };
