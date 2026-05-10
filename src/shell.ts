@@ -94,10 +94,11 @@ ${slotSkeleton('call to action')}
   }
 
   async function consume() {
+    var reader = null;
     try {
       var res = await fetch('/stream', { credentials: 'same-origin' });
       if (!res.ok || !res.body) { setStatus('Stream failed'); return; }
-      var reader = res.body.getReader();
+      reader = res.body.getReader();
       var decoder = new TextDecoder();
       var buf = '';
       while (true) {
@@ -116,7 +117,10 @@ ${slotSkeleton('call to action')}
     } catch (e) {
       setStatus('Error');
       console.error(e);
+    } finally {
+      if (reader) { try { reader.cancel(); } catch (_) {} }
     }
+  }
   }
   consume();
 })();
